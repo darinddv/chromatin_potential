@@ -9,4 +9,5 @@ requires-python = ">=3.10"
 dependencies = ["numpy"]
 
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["chromatin_potential*"]
