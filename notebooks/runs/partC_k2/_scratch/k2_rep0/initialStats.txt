@@ -1,0 +1,27 @@
+Platform Name: CUDA
+Platform Speed: 100.0
+Platform Property Names: ('DeviceIndex', 'DeviceName', 'UseBlockingSync', 'Precision', 'UseCpuPme', 'CudaCompiler', 'TempDirectory', 'CudaHostCompiler', 'DisablePmeStream', 'DeterministicForces')
+DeviceIndex Value: 0
+DeviceName Value: NVIDIA RTX A3000 12GB Laptop GPU
+UseBlockingSync Value: false
+Precision Value: mixed
+UseCpuPme Value: false
+CudaCompiler Value: 
+TempDirectory Value: C:\Users\user\AppData\Local\Temp
+CudaHostCompiler Value: 
+DisablePmeStream Value: false
+DeterministicForces Value: false
+
+Simulation name: OpenMiChroM
+Number of beads: 2676, Number of chains: 1
+Potential energy: 65.95677, Kinetic Energy: 1.64138 at temperature: 1.0
+
+Potential energy per forceGroup:
+                                  Values
+FENEBond                   62392.576950
+AngleForce                    86.578393
+SelfAvoidance                  0.000000
+CustomTypes                 -220.504516
+IdealChromosome               -1.100999
+FlatBottomHarmonic        114242.762580
+Potential Energy (total)  176500.312407
