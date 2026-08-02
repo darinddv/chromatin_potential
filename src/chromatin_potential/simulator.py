@@ -326,6 +326,14 @@ class Simulator:
         os.makedirs(self.work_root, exist_ok=True)
 
     # ---------- internals ----------
+    def sequence_names(self):
+        """Per-bead names from the ChromSeq file (2nd column). These are the
+        names OpenMiChroM's addCustomTypes expects in the .ff header."""
+        if getattr(self, "_seq_names", None) is None:
+            self._seq_names = [l.split()[1] for l in open(self.seq_file)
+                               if l.strip()]
+        return self._seq_names
+
     def _scratch(self, name):
         return os.path.join(self.work_root, name)
 
@@ -375,7 +383,12 @@ class Simulator:
         ff_path = None
         if model is not None:
             ff_path = os.path.join(self._scratch(name), "_coupling.ff")
-            model.write_ff(ff_path)
+            # The .ff header MUST match the names in the ChromSeq file.
+            # A per-BEAD model (one row per bead) takes the bead names from the
+            # sequence file; a per-TYPE model keeps its own type names.
+            seq_names = self.sequence_names()
+            bead_names = seq_names if model.N == len(seq_names) else None
+            model.write_ff(ff_path, bead_names=bead_names)
             sim.addCustomTypes(TypesTable=ff_path, mu=MU, rc=RC)
         elif types_table is not None:
             sim.addCustomTypes(TypesTable=types_table, mu=MU, rc=RC)
