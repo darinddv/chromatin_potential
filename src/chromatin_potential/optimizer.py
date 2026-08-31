@@ -253,7 +253,19 @@ class Optimizer:
                 Lambda is a residual against a fixed background, so a Lambda
                 fitted in one environment is not valid in another.
     target    : (N, N) target contact probability map.
-    lr_lambda, lr_C : Adam step sizes. Deliberately conservative. Too large a
+    lr_lambda, lr_C : Adam step sizes. Deliberately conservative.
+
+                WHEN C IS TRAINABLE, SET lr_C SUBSTANTIALLY LARGER THAN
+                lr_lambda (a ratio of ~3 works; see below). C and Lambda are
+                coupled, and there is a trap: if C points in the wrong direction,
+                the best Lambda for that wrong C is near ZERO -- switching the
+                compartment term off beats getting it wrong. But the C gradient
+                is  dL/dC = 2 G C Lambda,  so once Lambda ~ 0 the C gradient
+                vanishes too and C can never recover. The fit collapses to "no
+                structure" and self-traps there. Measured on a mock: at
+                lr_C = lr_lambda the fit went to lambda = -0.03 with loss equal
+                to the lambda = 0 reference; at lr_C = 3 x lr_lambda it recovered
+                lambda = -1.09 (true -1.2) with |corr(C, C_true)| = 0.98. Too large a
                 step overshoots and then trips the plateau test, which LOOKS like
                 convergence but leaves the parameter wrong (observed on a mock
                 landscape: lr 0.15 -> 10% error and an early plateau stop, lr
@@ -268,7 +280,8 @@ class Optimizer:
     def __init__(self, simulator: Simulator, target: np.ndarray,
                  lr_lambda=0.005, lr_C=0.002, fit_c=False,
                  sep_min=3, sep_max=None, budget: Budget = None,
-                 out_dir=None, tag="fit", verbose=True):
+                 out_dir=None, tag="fit", verbose=True,
+                 verbose_replicas=False, quiet_sim=True):
         self.sim = simulator
         self.target = np.asarray(target, float)
         self.lr_lambda = lr_lambda
@@ -280,6 +293,14 @@ class Optimizer:
         self.out_dir = out_dir or os.path.join(simulator.out_dir, "fits")
         self.tag = tag
         self.verbose = verbose
+        # per-replica heartbeat inside an iteration (off by default: the
+        # per-iteration summary is usually enough, but a 500k x 20 iteration is
+        # a long silence).
+        self.verbose_replicas = verbose_replicas
+        # suppress OpenMiChroM's banner + energy table, which is otherwise
+        # reprinted once per replica per iteration and buries the fit log.
+        if quiet_sim:
+            self.sim.quiet = True
         os.makedirs(self.out_dir, exist_ok=True)
 
     def _log(self, msg):
@@ -295,6 +316,7 @@ class Optimizer:
                         forces=False, interval=1000, monitor=False)
         cond = f"{self.tag}_it{it:03d}"
         maps, finals, convs = [], [], []
+        t_it = time.time()
         for s in range(self.budget.n_replicas):
             init = None
             if warm_start is not None and s < len(warm_start):
@@ -314,6 +336,14 @@ class Optimizer:
             finals.append(xyz[-1])
             md = self.sim.load_metadata(cond, s)
             convs.append(md.get("convergence", float("nan")))
+            # one compact line per replica: enough to see progress on a long
+            # iteration (500k x 20 is a long silence otherwise) without the
+            # per-block spam that report=True produces.
+            if self.verbose_replicas:
+                warm = "warm" if init is not None else "cold"
+                self._log(f"      rep {s+1}/{self.budget.n_replicas} ({warm})  "
+                          f"conv={convs[-1]:.3f}  "
+                          f"{(time.time()-t_it)/60:.1f} min elapsed")
         P = np.mean(maps, axis=0)
         return P, maps, finals, convs
 
@@ -336,7 +366,8 @@ class Optimizer:
 
     # ---------- the loop ----------
     def fit(self, model: Model, n_iter=60, patience=8, rel_tol=1e-4,
-            worsen_window=4, worsen_tol=0.02):
+            worsen_window=4, worsen_tol=0.02, gauge="unit_variance",
+            max_conv_growths=6, collapse_tol=1e-2, history_path=None):
         """Run the simulate-and-fit loop.
 
         Stops when any of:
@@ -354,6 +385,9 @@ class Optimizer:
                       kernel=model.kernel, C_trainable=model.C_trainable,
                       Lam_trainable=model.Lam_trainable, names=model.names)
 
+        if model.C_trainable:
+            model.gauge_fix(mode=gauge)      # start in the fixed gauge
+
         adam_L = Adam(model.Lam.shape, lr=self.lr_lambda)
         adam_C = Adam(model.C.shape, lr=self.lr_C)
         adam_c = Adam((), lr=self.lr_lambda)
@@ -367,6 +401,7 @@ class Optimizer:
         # a k=1 fit reached lambda ~ -1.25 at the loss minimum, then drifted to
         # -1.53 (28% error) before stopping, with the loss rising the whole way.
         best_params = (model.Lam.copy(), model.C.copy(), model.c)
+        conv_growths = 0
 
         for it in range(n_iter):
             P, maps, finals, convs = self._simulate(model, it, warm_start=warm)
@@ -392,10 +427,23 @@ class Optimizer:
                 "median_convergence": med_conv,
                 "Lambda": model.Lam.tolist(),
                 "c": model.c,
+                # C diagnostics: with the gauge fixed, C_std should stay ~1.
+                # A growing C_absmax with flat C_std means the coordinate is
+                # developing extreme outliers -> expect convergence to fall.
+                "lam_absmax": float(np.abs(model.Lam).max()),
+                "C_std": float(model.C.std()),
+                "C_absmax": float(np.abs(model.C).max()),
+                "M_min": float(model.coupling_matrix().min()),
+                "M_max": float(model.coupling_matrix().max()),
             }
             res.history.append(rec)
+            if history_path:                 # incremental: survives interruption
+                with open(history_path, "w") as fh:
+                    json.dump(res.history, fh, indent=1, default=str)
             self._log(f"  it {it:3d}  loss {loss:.4e}  |g| {rec['grad_norm']:.3e}  "
                       f"snr {snr_max:.2f}  conv {med_conv:.3f}  "
+                      f"|C|max {rec['C_absmax']:.2f}  "
+                      f"M[{rec['M_min']:+.2f},{rec['M_max']:+.2f}]  "
                       f"budget {self.budget.n_steps}x{self.budget.n_replicas}")
 
             # ---- budget adaptation ----
@@ -411,6 +459,22 @@ class Optimizer:
                 self.budget.grow("low snr", self._log)
             # (b) warm-started ensemble not relaxed under the new potential
             elif np.isfinite(med_conv) and med_conv < self.budget.conv_target:
+                conv_growths += 1
+                if conv_growths > max_conv_growths and self.budget.at_ceiling():
+                    # Growing the budget assumes longer runs will equilibrate.
+                    # If the POTENTIAL itself does not relax (e.g. gauge drift
+                    # has produced extreme couplings, or the coordinate has gone
+                    # glassy), more sampling never helps and the optimizer burns
+                    # its whole allowance. Stop and say so.
+                    res.stop_reason = (
+                        f"ensembles not equilibrating (median convergence "
+                        f"{med_conv:.3f} < {self.budget.conv_target}) at the "
+                        f"budget ceiling -- the potential is not relaxing, not "
+                        f"under-sampled. Check |C| and the coupling range.")
+                    res.converged = False
+                    res.noise_floor = best
+                    self._log(f"  STOP -- {res.stop_reason}")
+                    break
                 self.budget.grow("low within-run convergence", self._log)
 
             # ---- parameter update ----
@@ -419,8 +483,30 @@ class Optimizer:
                 model.Lam = 0.5 * (model.Lam + model.Lam.T)
             if model.C_trainable:
                 model.C = model.C + adam_C.step(gC)
+                # REMOVE THE GAUGE FREEDOM EVERY ITERATION. C -> CA,
+                # Lambda -> A^-1 Lambda A^-T leaves M unchanged, so the loss
+                # exerts no force along it and the optimizer drifts: C inflates,
+                # couplings become extreme, the polymer goes glassy and stops
+                # equilibrating. Without this, a free-C run drove the simulation
+                # budget to its ceiling while within-run convergence sat at 0.82.
+                model.gauge_fix(mode=gauge)
             if self.fit_c:
                 model.c = model.c + float(adam_c.step(np.array(gc)))
+
+            # ---- Lambda-collapse check (free C only) ----
+            if model.C_trainable:
+                lam_scale = float(np.abs(model.Lam).max())
+                if lam_scale < collapse_tol:
+                    res.stop_reason = (
+                        f"Lambda collapsed to ~0 (max|Lambda| = {lam_scale:.2e}). "
+                        f"The fit has switched the compartment term OFF, and "
+                        f"because dL/dC = 2 G C Lambda the C gradient has "
+                        f"vanished with it -- C can no longer learn. Raise lr_C "
+                        f"relative to lr_lambda (try 3x) and restart.")
+                    res.converged = False
+                    res.noise_floor = best
+                    self._log(f"  STOP -- {res.stop_reason}")
+                    break
 
             # ---- plateau / divergence check ----
             if loss < best * (1 - rel_tol):

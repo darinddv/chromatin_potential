@@ -201,14 +201,34 @@ class Model:
                    C_trainable=False, Lam_trainable=True, **kw)
 
     @classmethod
-    def free(cls, N, k, seed=0, scale=0.1, c=0.0, **kw):
-        """Blind reduced-rank init: free C (rank k) and free Lam, to be learned
-        by the optimizer. This is the 'reduced-rank Fi-chrom with no biology in'
-        arm."""
+    def free(cls, N, k, seed=0, scale=1.0, c=0.0, smooth=5, lam0=-0.5, **kw):
+        """Blind reduced-rank init: free C (rank k) and free Lambda, both learned
+        ('reduced-rank Fi-chrom with no biology in').
+
+        Two choices here matter for whether the fit is well behaved:
+
+        * C is SMOOTHED along the chain, not iid noise. An iid C with an
+          attractive Lambda is a random heteropolymer -- the textbook glass
+          former -- which equilibrates badly and can trap the optimizer in a
+          non-relaxing state from the first iteration. Smoothing gives
+          domain-like structure of the kind real coordinates have, without
+          encoding any actual biology.
+        * Lambda starts ATTRACTIVE (negative) and weak. The previous default
+          (+1, repulsive) had to cross zero to reach any sensible potential.
+
+        C is gauge-fixed to unit variance on construction.
+        """
         rng = np.random.default_rng(seed)
-        C = rng.normal(0, scale, (N, k))
-        Lam = np.eye(k)                    # start neutral; optimizer moves it
-        return cls(C, Lam, c=c, C_trainable=True, Lam_trainable=True, **kw)
+        C = rng.normal(0, 1.0, (N, k))
+        if smooth and smooth > 1:
+            kern = np.ones(smooth) / smooth
+            C = np.apply_along_axis(
+                lambda v: np.convolve(v, kern, mode="same"), 0, C)
+        C = (C - C.mean(axis=0)) / (C.std(axis=0) + 1e-12) * scale
+        Lam = np.eye(k) * lam0
+        m = cls(C, Lam, c=c, C_trainable=True, Lam_trainable=True, **kw)
+        m.gauge_fix()
+        return m
 
     # ---- bead expansion (types -> per-bead) ----
     def expand_to_beads(self, label_sequence):
@@ -260,11 +280,47 @@ class Model:
         w = np.linalg.eigvalsh(self.Lam)
         return w[np.argsort(-np.abs(w))]
 
-    def gauge_fix(self):
-        """Reserved: fix the matrix-valued gauge freedom for free-C, k>=2
-        (C -> M C, Lam -> M^-T Lam M^-1). Not needed for fixed-C or k=1.
-        Stub so the interface is stable; implement when free-C k>=2 is run."""
-        raise NotImplementedError("gauge_fix: implement for free-C, k>=2.")
+    def gauge_fix(self, mode="unit_variance"):
+        """Remove the gauge freedom in (C, Lambda), IN PLACE.
+
+        The bilinear coupling M = c + C Lambda C^T is invariant under
+            C -> C A,   Lambda -> A^-1 Lambda A^-T
+        for any invertible A. For k=1 this is the scalar freedom
+            C -> sC,    lambda -> lambda / s^2.
+
+        MUST be applied every iteration when C is trainable. Otherwise the
+        optimizer drifts along this exactly-flat direction: C inflates while
+        Lambda shrinks, M is unchanged so the loss gives no resistance, but the
+        individual bead couplings become extreme and the polymer turns glassy
+        and stops equilibrating. Observed directly in a free-C run -- within-run
+        convergence fell to 0.82 and stayed there while the simulation budget
+        was driven to its ceiling trying to fix it by sampling harder.
+
+        mode:
+          'unit_variance' : each column of C standardised to unit variance,
+                            the scale absorbed into Lambda. Cheap, and it is the
+                            convention the optimized-tier plan specifies.
+          'orthonormal'   : columns orthonormalised (QR), the mixing absorbed
+                            into Lambda. For k >= 2 this also removes the
+                            rotational part of the freedom, not just the scale.
+        Returns the applied A (for diagnostics).
+        """
+        C = self.C
+        if mode == "unit_variance":
+            s = C.std(axis=0)
+            s = np.where(s > 1e-12, s, 1.0)
+            A = np.diag(1.0 / s)                 # C -> C A
+        elif mode == "orthonormal":
+            Q, R = np.linalg.qr(C)
+            # C = Q R  ->  choose A = R^-1 so that C A = Q
+            A = np.linalg.inv(R + np.eye(R.shape[0]) * 1e-12)
+        else:
+            raise ValueError(f"unknown gauge mode {mode!r}")
+        Ainv = np.linalg.inv(A)
+        self.C = C @ A
+        self.Lam = Ainv @ self.Lam @ Ainv.T
+        self.Lam = 0.5 * (self.Lam + self.Lam.T)
+        return A
 
 
 # =====================================================================

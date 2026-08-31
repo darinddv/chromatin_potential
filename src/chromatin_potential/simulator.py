@@ -38,6 +38,8 @@ through.
 """
 
 from __future__ import annotations
+import contextlib
+import io
 import os
 import gc
 import glob
@@ -312,7 +314,7 @@ class Simulator:
 
     def __init__(self, seq_file, out_dir, background=None, platform="cuda",
                  work_root=None, conv_threshold=0.9,
-                 temperature=TEMPERATURE, timestep=TIMESTEP):
+                 temperature=TEMPERATURE, timestep=TIMESTEP, quiet=False):
         self.seq_file = seq_file
         self.out_dir = out_dir
         self.background = background or BackgroundStack()
@@ -321,9 +323,30 @@ class Simulator:
         self.conv_threshold = conv_threshold
         self.temperature = temperature
         self.timestep = timestep
+        # OpenMiChroM reprints its full banner and per-force energy table on
+        # EVERY MiChroM() construction. Across an optimizer fit that is one
+        # block per replica per iteration -- thousands of screens of text that
+        # bury the fit's own log. `quiet` suppresses it by capturing stdout
+        # during construction only; OpenMiChroM itself is untouched, and the
+        # captured text is kept on `.last_banner` if it is ever needed.
+        self.quiet = quiet
+        self.last_banner = ""
         for sub in ("maps", "traj", "meta"):
             os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
         os.makedirs(self.work_root, exist_ok=True)
+
+    @contextlib.contextmanager
+    def _muffle(self):
+        """Capture library chatter during system construction if quiet."""
+        if not self.quiet:
+            yield
+            return
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                yield
+        finally:
+            self.last_banner = buf.getvalue()
 
     # ---------- internals ----------
     def sequence_names(self):
@@ -362,41 +385,43 @@ class Simulator:
         from OpenMiChroM.ChromDynamics import MiChroM
 
         os.makedirs(self._scratch(name), exist_ok=True)
-        sim = MiChroM(temperature=self.temperature, timeStep=self.timestep)
-        sim.setup(platform=self.platform)
-        sim.saveFolder(self._scratch(name))
+        with self._muffle():
+            sim = MiChroM(temperature=self.temperature, timeStep=self.timestep)
+            sim.setup(platform=self.platform)
+            sim.saveFolder(self._scratch(name))
 
-        # Type registration REQUIRES createSpringSpiral even when the
-        # coordinates are then overridden (OpenMiChroM design constraint).
-        struct = sim.createSpringSpiral(ChromSeq=self.seq_file, isRing=False)
-        if initial_coords is None:
-            s = np.asarray(struct, float)
-            if perturb and seed is not None:
-                s = s + np.random.default_rng(seed).normal(0, 0.05, s.shape)
-            sim.loadStructure(s, center=True)
-        else:
-            # center=False preserves the exact incoming configuration
-            sim.loadStructure(np.asarray(initial_coords, float), center=False)
+        with self._muffle():
+            # Type registration REQUIRES createSpringSpiral even when the
+            # coordinates are then overridden (OpenMiChroM design constraint).
+            struct = sim.createSpringSpiral(ChromSeq=self.seq_file, isRing=False)
+            if initial_coords is None:
+                s = np.asarray(struct, float)
+                if perturb and seed is not None:
+                    s = s + np.random.default_rng(seed).normal(0, 0.05, s.shape)
+                sim.loadStructure(s, center=True)
+            else:
+                # center=False preserves the exact incoming configuration
+                sim.loadStructure(np.asarray(initial_coords, float), center=False)
 
-        self.background.apply_pre_compartment(sim)
+            self.background.apply_pre_compartment(sim)
 
-        ff_path = None
-        if model is not None:
-            ff_path = os.path.join(self._scratch(name), "_coupling.ff")
-            # The .ff header MUST match the names in the ChromSeq file.
-            # A per-BEAD model (one row per bead) takes the bead names from the
-            # sequence file; a per-TYPE model keeps its own type names.
-            seq_names = self.sequence_names()
-            bead_names = seq_names if model.N == len(seq_names) else None
-            model.write_ff(ff_path, bead_names=bead_names)
-            sim.addCustomTypes(TypesTable=ff_path, mu=MU, rc=RC)
-        elif types_table is not None:
-            sim.addCustomTypes(TypesTable=types_table, mu=MU, rc=RC)
-        else:
-            sim.addTypetoType(mu=MU, rc=RC)
+            ff_path = None
+            if model is not None:
+                ff_path = os.path.join(self._scratch(name), "_coupling.ff")
+                # The .ff header MUST match the names in the ChromSeq file.
+                # A per-BEAD model (one row per bead) takes the bead names from
+                # the sequence file; a per-TYPE model keeps its own type names.
+                seq_names = self.sequence_names()
+                bead_names = seq_names if model.N == len(seq_names) else None
+                model.write_ff(ff_path, bead_names=bead_names)
+                sim.addCustomTypes(TypesTable=ff_path, mu=MU, rc=RC)
+            elif types_table is not None:
+                sim.addCustomTypes(TypesTable=types_table, mu=MU, rc=RC)
+            else:
+                sim.addTypetoType(mu=MU, rc=RC)
 
-        self.background.apply_post_compartment(sim, confinement=confinement)
-        sim.createSimulation()
+            self.background.apply_post_compartment(sim, confinement=confinement)
+            sim.createSimulation()
         return sim, ff_path
 
     # ---------- the run ----------
@@ -446,13 +471,14 @@ class Simulator:
                           and tuple(phases) == ("production",)),
         })
 
-        if "collapse" in phases:
-            sim.run(nsteps=N_STEPS_COLLAPSE, checkSystem=True, report=True,
-                    blockSize=COLLAPSE_BLOCKSIZE)
-            if self.background.phase1_confinement:
-                sim.removeFlatBottomHarmonic()
-        if "equil" in phases:
-            sim.run(nsteps=N_STEPS_EQUIL, report=True)
+        with self._muffle():
+            if "collapse" in phases:
+                sim.run(nsteps=N_STEPS_COLLAPSE, checkSystem=True, report=True,
+                        blockSize=COLLAPSE_BLOCKSIZE)
+                if self.background.phase1_confinement:
+                    sim.removeFlatBottomHarmonic()
+            if "equil" in phases:
+                sim.run(nsteps=N_STEPS_EQUIL, report=True)
 
         frames = vels = forces = None
         rg_trace = []
