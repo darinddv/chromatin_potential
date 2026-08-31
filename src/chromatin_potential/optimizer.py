@@ -210,7 +210,9 @@ def project_gradient(G, model, fit_c=False):
 
 @dataclass
 class FitResult:
-    model: Model
+    model: Model                      # BEST iterate (minimum loss), not the last
+    final_model: Model = None         # last iterate, for diagnostics
+    best_iter: int = -1
     history: list = field(default_factory=list)
     converged: bool = False
     stop_reason: str = ""
@@ -333,14 +335,19 @@ class Optimizer:
             np.full(gs.shape[1], np.nan)
 
     # ---------- the loop ----------
-    def fit(self, model: Model, n_iter=60, patience=8, rel_tol=1e-4):
+    def fit(self, model: Model, n_iter=60, patience=8, rel_tol=1e-4,
+            worsen_window=4, worsen_tol=0.02):
         """Run the simulate-and-fit loop.
 
         Stops when any of:
           - the gradient is inside its own standard error at the budget ceiling
             (the NOISE FLOOR -- a legitimate result, not a failure),
+          - the loss RISES for `worsen_window` consecutive iterations and is
+            `worsen_tol` above the best seen (overshoot; lower the learning rate),
           - the loss stops improving for `patience` iterations,
           - n_iter is reached.
+
+        Returns the BEST iterate in `.model` and the last in `.final_model`.
         """
         t0 = time.time()
         model = Model(model.C.copy(), model.Lam.copy(), c=model.c,
@@ -354,6 +361,12 @@ class Optimizer:
         res = FitResult(model=model,
                         background_key=self.sim.background.key())
         best, best_it, warm = np.inf, -1, None
+        # snapshot of the best-so-far parameters. Returning the LAST iterate is
+        # wrong for a noisy objective: the optimizer can walk past the minimum
+        # and sit there while the plateau test counts down. Observed directly --
+        # a k=1 fit reached lambda ~ -1.25 at the loss minimum, then drifted to
+        # -1.53 (28% error) before stopping, with the loss rising the whole way.
+        best_params = (model.Lam.copy(), model.C.copy(), model.c)
 
         for it in range(n_iter):
             P, maps, finals, convs = self._simulate(model, it, warm_start=warm)
@@ -409,19 +422,43 @@ class Optimizer:
             if self.fit_c:
                 model.c = model.c + float(adam_c.step(np.array(gc)))
 
-            # ---- plateau check ----
+            # ---- plateau / divergence check ----
             if loss < best * (1 - rel_tol):
                 best, best_it = loss, it
-            elif it - best_it >= patience:
-                res.stop_reason = f"loss plateau ({patience} iterations)"
-                res.converged = True
-                res.noise_floor = loss
-                self._log(f"  STOP -- {res.stop_reason}")
-                break
+                best_params = (model.Lam.copy(), model.C.copy(), model.c)
+            else:
+                # sustained WORSENING is a stronger signal than mere flatness:
+                # it means the step size is carrying the parameters past the
+                # minimum. Stop sooner than the plain plateau rule would.
+                recent = [h["loss"] for h in res.history[-worsen_window:]]
+                if (len(recent) == worsen_window
+                        and all(np.diff(recent) > 0)
+                        and loss > best * (1 + worsen_tol)):
+                    res.stop_reason = (f"loss rising for {worsen_window} "
+                                       f"iterations past the minimum "
+                                       f"(best at iter {best_it}) -- "
+                                       f"lr may be too large")
+                    res.converged = True
+                    res.noise_floor = best
+                    self._log(f"  STOP -- {res.stop_reason}")
+                    break
+                if it - best_it >= patience:
+                    res.stop_reason = f"loss plateau ({patience} iterations)"
+                    res.converged = True
+                    res.noise_floor = best
+                    self._log(f"  STOP -- {res.stop_reason}")
+                    break
         else:
             res.stop_reason = f"reached n_iter={n_iter}"
 
-        res.model = model
+        # return the BEST iterate; keep the last one for diagnostics
+        res.final_model = model
+        res.best_iter = best_it
+        bLam, bC, bc = best_params
+        res.model = Model(bC, bLam, c=bc, kernel=model.kernel,
+                          C_trainable=model.C_trainable,
+                          Lam_trainable=model.Lam_trainable, names=model.names)
+        self._log(f"  best iterate: iter {best_it}, loss {best:.4e}")
         res.wall_minutes = (time.time() - t0) / 60.0
         res.to_json(os.path.join(self.out_dir, f"{self.tag}.json"))
         self._log(f"  done in {res.wall_minutes:.1f} min -- {res.stop_reason}")
