@@ -5,7 +5,11 @@ The maximum-entropy gradient is nearly free: for a coupling that multiplies the
 contact function f(r_ij), the derivative of the objective w.r.t. that coupling is
 just the difference between simulated and target contact probability
 
-    G_ij = phi_sim_ij - phi_exp_ij
+    G_ij = phi_exp_ij - phi_sim_ij
+
+(NOTE THE SIGN: the coupling multiplies an ATTRACTIVE term, so more negative
+coupling => more contacts, i.e. dP/dM < 0. See map_residual for the derivation.
+Getting this backwards recovers the NEGATIVE of the true coupling.)
 
 No autodiff, no differentiating through MD. (Same result Zhang & Wolynes 2015 and
 Fi-chrom use.) The chain rule down to the low-rank parameters is linear algebra:
@@ -141,20 +145,42 @@ class Adam:
 # =====================================================================
 
 def map_residual(P_sim, P_exp, sep_min=3, sep_max=None):
-    """G = P_sim - P_exp, masked. Near-diagonal pairs are excluded because they
-    are dominated by chain connectivity (the backbone and ideal-chromosome terms
-    own them), not by the compartment coupling being fitted."""
+    """Descent direction in map space, masked.
+
+    SIGN -- read this before touching it.
+
+    The loss is mean((P_sim - P_exp)^2), so
+        dL/dM = 2 (P_sim - P_exp) * dP/dM.
+
+    In MiChroM the coupling multiplies an ATTRACTIVE contact term: a more
+    NEGATIVE coupling means stronger attraction, hence MORE contacts. So contact
+    probability is a DECREASING function of the coupling, dP/dM < 0, and
+
+        dL/dM  proportional to  (P_exp - P_sim).
+
+    Equivalently, this is the standard maximum-entropy update
+    alpha <- alpha + eta (phi_sim - phi_exp): when the simulation has too few
+    contacts (phi_sim < phi_exp) the coupling must become more negative.
+
+    Returning (P_exp - P_sim) therefore gives a quantity that can be DESCENDED.
+    Using (P_sim - P_exp) drives the fit away from the answer and flips the sign
+    of the recovered coupling -- observed directly in self-recovery, where a true
+    lambda of -1.2 was "recovered" as +0.36 with M correlation exactly -1.000.
+
+    (The positive factor |dP/dM| is absorbed into the learning rate.)
+    """
     N = P_sim.shape[0]
     sep = np.abs(np.subtract.outer(np.arange(N), np.arange(N)))
     mask = sep >= sep_min
     if sep_max is not None:
         mask &= sep <= sep_max
-    G = np.where(mask, P_sim - P_exp, 0.0)
+    G = np.where(mask, P_exp - P_sim, 0.0)
     return G, mask
 
 
 def loss_from_residual(G, mask):
-    """Mean squared residual over the masked pairs."""
+    """Mean squared residual over the masked pairs. Sign-independent, so it is
+    the same whether G is (P_sim - P_exp) or (P_exp - P_sim)."""
     return float((G[mask] ** 2).mean())
 
 
@@ -297,7 +323,8 @@ class Optimizer:
         which the gradient magnitude is judged, and hence the noise floor."""
         gs = []
         for P in per_replica_maps:
-            G = np.where(mask, P - target, 0.0)
+            # same sign convention as map_residual (P_exp - P_sim); see there
+            G = np.where(mask, target - P, 0.0)
             gLam, gC, gc = project_gradient(G, model, fit_c=fit_c)
             gs.append(np.concatenate([gLam.ravel(), gC.ravel(), [gc]]))
         gs = np.array(gs)
