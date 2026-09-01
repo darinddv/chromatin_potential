@@ -414,7 +414,7 @@ class Optimizer:
     # ---------- the loop ----------
     def fit(self, model: Model, n_iter=60, patience=8, rel_tol=1e-4,
             worsen_window=4, worsen_tol=0.02, n_sigma=2.0, scale_lr=True,
-            use_susceptibility=True,
+            use_susceptibility=True, min_iters=12,
             gauge="unit_variance", max_conv_growths=6, collapse_tol=1e-2,
             history_path=None):
         """Run the simulate-and-fit loop.
@@ -482,6 +482,11 @@ class Optimizer:
                 "grad_norm": float(np.linalg.norm(gvec)),
                 "snr_max": snr_max,
                 "loss_se": loss_se,
+                # The loss contains a REPLICA-NOISE FLOOR of order sigma^2/n, so
+                # loss values are only comparable between runs with the SAME
+                # n_replicas and n_steps. Recorded here to make that checkable.
+                "loss_sampling": [int(self.budget.n_replicas),
+                                  int(self.budget.n_steps)],
                 "n_steps": self.budget.n_steps,
                 "n_replicas": self.budget.n_replicas,
                 "median_convergence": med_conv,
@@ -573,9 +578,15 @@ class Optimizer:
             # Thresholds are set from the measured loss noise, not a fixed
             # fraction. A constant threshold below the noise level makes the
             # stopping rules fire at random.
+            # Take the LARGER of the relative and noise-based thresholds.
+            # Using n_sigma*loss_se ALONE is a mistake: loss_se is the standard
+            # error of the mean over replicas, which is far smaller than the
+            # iteration-to-iteration scatter (different conformations, warm-start
+            # drift). Substituting it made the worsening rule fire on the first
+            # few noise-level upticks and return the STARTING model unchanged.
             if np.isfinite(loss_se) and loss_se > 0:
                 improve_thresh = max(rel_tol * best, n_sigma * loss_se)
-                worsen_thresh = n_sigma * loss_se
+                worsen_thresh = max(worsen_tol * best, n_sigma * loss_se)
             else:
                 improve_thresh = rel_tol * best
                 worsen_thresh = worsen_tol * best
@@ -588,7 +599,8 @@ class Optimizer:
                 # it means the step size is carrying the parameters past the
                 # minimum. Stop sooner than the plain plateau rule would.
                 recent = [h["loss"] for h in res.history[-worsen_window:]]
-                if (len(recent) == worsen_window
+                if (it >= min_iters
+                        and len(recent) == worsen_window
                         and all(np.diff(recent) > 0)
                         and loss > best + worsen_thresh):
                     res.stop_reason = (
@@ -599,7 +611,7 @@ class Optimizer:
                     res.noise_floor = best
                     self._log(f"  STOP -- {res.stop_reason}")
                     break
-                if it - best_it >= patience:
+                if it >= min_iters and it - best_it >= patience:
                     res.stop_reason = f"loss plateau ({patience} iterations)"
                     res.converged = True
                     res.noise_floor = best
