@@ -591,7 +591,14 @@ class Optimizer:
                 improve_thresh = rel_tol * best
                 worsen_thresh = worsen_tol * best
 
-            if loss < best - improve_thresh:
+            # NOTE the isfinite guard. `best` starts at inf, so
+            # improve_thresh = max(rel_tol*best, ...) is inf and
+            # `best - improve_thresh` is inf - inf = nan; every comparison
+            # against nan is False, so WITHOUT this guard the first iteration
+            # never registers, best_params is never set, and the fit returns the
+            # STARTING model while reporting "best iterate: iter -1, loss inf"
+            # -- even though the loss descended monotonically throughout.
+            if (not np.isfinite(best)) or (loss < best - improve_thresh):
                 best, best_it = loss, it
                 best_params = (model.Lam.copy(), model.C.copy(), model.c)
             else:
