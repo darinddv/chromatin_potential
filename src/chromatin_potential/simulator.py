@@ -190,21 +190,41 @@ SAVE_EVERYTHING = SaveSpec(contact_map=True, trajectory=True, velocities=True,
 # Contact map estimator -- identical to OpenMiChroM cndbTools.traj2HiC
 # =====================================================================
 
-def contact_probability(xyz, mu=MU, rc=RC):
+def contact_probability(xyz, mu=MU, rc=RC, return_var=False):
     """Pooled contact probability map from frames (n_frames, n_beads, 3).
 
     f(r) = 0.5*(1 + tanh[mu*(rc - r)]), the SAME estimator as OpenMiChroM's
     cndbTools.traj2HiC (which averages over frames), so maps are directly
     comparable to every previously computed result.
+
+    return_var: also return Var(f_ij) over frames. This is the CONTACT
+    SUSCEPTIBILITY: by fluctuation-dissipation, for a Boltzmann ensemble
+
+        d<f_ij> / d(coupling_ij)  =  -beta * Var(f_ij)
+
+    so it is the local sensitivity of the map to the coupling. Saturated pairs
+    (f near 0 or 1) have Var ~ 0 and barely respond. The optimizer needs this to
+    weight the gradient correctly for multi-parameter models -- see
+    project_gradient in optimizer.py. Computing it here costs one extra
+    accumulation over frames and no extra simulation.
     """
     from scipy.spatial import distance
     xyz = np.asarray(xyz)
     n = xyz.shape[1]
+    nf = xyz.shape[0]
     P = np.zeros((n, n), dtype=np.float64)
-    for f in range(xyz.shape[0]):
+    P2 = np.zeros((n, n), dtype=np.float64) if return_var else None
+    for f in range(nf):
         d = distance.cdist(xyz[f], xyz[f], "euclidean")
-        P += 0.5 * (1.0 + np.tanh(mu * (rc - d)))
-    return P / xyz.shape[0]
+        fij = 0.5 * (1.0 + np.tanh(mu * (rc - d)))
+        P += fij
+        if return_var:
+            P2 += fij * fij
+    P /= nf
+    if not return_var:
+        return P
+    var = np.maximum(P2 / nf - P * P, 0.0)
+    return P, var
 
 
 def radius_of_gyration(x):

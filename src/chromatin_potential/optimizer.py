@@ -178,25 +178,70 @@ def map_residual(P_sim, P_exp, sep_min=3, sep_max=None):
     return G, mask
 
 
+def loss_standard_error(per_replica_maps, target, mask):
+    """Standard error of the LOSS, from the between-replica spread.
+
+    Free: the per-replica maps already exist. Needed because the stopping rules
+    compare loss differences, and a fixed relative threshold is meaningless if it
+    sits below the noise. Measured on the toy system: the loss varies ~10%
+    between repeat evaluations at 4 replicas, while the default worsening
+    threshold was 2% -- so four consecutive "increases" occurred by chance and
+    the fit stopped at a noise-driven point 36% worse than achievable.
+    """
+    ls = []
+    for P in per_replica_maps:
+        R = np.where(mask, target - P, 0.0)
+        ls.append(float((R[mask] ** 2).mean()))
+    n = len(ls)
+    if n < 2:
+        return float("nan")
+    return float(np.std(ls, ddof=1) / np.sqrt(n))
+
+
 def loss_from_residual(G, mask):
     """Mean squared residual over the masked pairs. Sign-independent, so it is
     the same whether G is (P_sim - P_exp) or (P_exp - P_sim)."""
     return float((G[mask] ** 2).mean())
 
 
-def project_gradient(G, model, fit_c=False):
+def project_gradient(G, model, fit_c=False, weight=None):
     """Push the map-space residual G down onto the model parameters.
 
     bilinear:  M = c + C Lambda C^T
-        dL/dLambda = C^T G C
-        dL/dC      = 2 G C Lambda     (Lambda symmetric)
-        dL/dc      = sum(G)
+        dL/dLambda = C^T (W o G) C
+        dL/dC      = 2 (W o G) C Lambda     (Lambda symmetric)
+        dL/dc      = sum(W o G)
+
+    `weight` W is the CONTACT SUSCEPTIBILITY |d<f_ij>/dM_ij|, estimated as
+    Var(f_ij) over frames (fluctuation-dissipation). WHY IT MATTERS:
+
+    The full chain rule is  dL/dM = 2 (P_sim - P_exp) * dP/dM.  Treating dP/dM
+    as a positive constant "absorbed into the learning rate" is harmless for a
+    SINGLE parameter -- only the sign sets the direction, and the fit slides to
+    the minimum along one axis. It is NOT harmless for k >= 2: the projection
+    weights each pair by c_i c_j, while dP/dM is small for strongly-coupled
+    pairs (they are saturated, f near 0 or 1, so they barely respond). The
+    approximation therefore over-weights exactly the pairs that respond least,
+    tilting the descent direction and converging to a stationary point of the
+    APPROXIMATE gradient rather than the true loss minimum.
+
+    Observed: k=1 recovered cleanly, while k=2 converged smoothly (loss trace
+    descended and plateaued, scatter 1% -- not a noise artefact) to loss
+    2.14e-2 when a point at 1.58e-2 existed along the line toward truth.
+
+    weight=None reproduces the old unweighted behaviour.
     """
     if model.kernel is not bilinear_kernel:
         raise NotImplementedError(
             "gradient projection is implemented for the bilinear kernel; "
             "other kernels need their own chain rule.")
     C, Lam = model.C, model.Lam
+    if weight is not None:
+        W = np.asarray(weight, float)
+        # normalise so the overall gradient scale (and hence a tuned learning
+        # rate) is preserved; only the RELATIVE weighting matters.
+        m = W.mean()
+        G = G * (W / m if m > 0 else 1.0)
     gLam = C.T @ G @ C
     gLam = 0.5 * (gLam + gLam.T)               # keep Lambda symmetric
     gC = 2.0 * (G @ C @ Lam)
@@ -315,7 +360,7 @@ class Optimizer:
         spec = SaveSpec(contact_map=True, trajectory=True, velocities=False,
                         forces=False, interval=1000, monitor=False)
         cond = f"{self.tag}_it{it:03d}"
-        maps, finals, convs = [], [], []
+        maps, finals, convs, varis = [], [], [], []
         t_it = time.time()
         for s in range(self.budget.n_replicas):
             init = None
@@ -332,7 +377,8 @@ class Optimizer:
                                  save_spec=spec, verbose=False, overwrite=True)
             d = self.sim.load_trajectory(cond, s)
             xyz = d["xyz"]
-            maps.append(contact_probability(xyz))
+            Pi, Vi = contact_probability(xyz, return_var=True)
+            maps.append(Pi); varis.append(Vi)
             finals.append(xyz[-1])
             md = self.sim.load_metadata(cond, s)
             convs.append(md.get("convergence", float("nan")))
@@ -345,6 +391,7 @@ class Optimizer:
                           f"conv={convs[-1]:.3f}  "
                           f"{(time.time()-t_it)/60:.1f} min elapsed")
         P = np.mean(maps, axis=0)
+        self._last_susceptibility = np.mean(varis, axis=0) if varis else None
         return P, maps, finals, convs
 
     @staticmethod
@@ -366,8 +413,10 @@ class Optimizer:
 
     # ---------- the loop ----------
     def fit(self, model: Model, n_iter=60, patience=8, rel_tol=1e-4,
-            worsen_window=4, worsen_tol=0.02, gauge="unit_variance",
-            max_conv_growths=6, collapse_tol=1e-2, history_path=None):
+            worsen_window=4, worsen_tol=0.02, n_sigma=2.0, scale_lr=True,
+            use_susceptibility=True,
+            gauge="unit_variance", max_conv_growths=6, collapse_tol=1e-2,
+            history_path=None):
         """Run the simulate-and-fit loop.
 
         Stops when any of:
@@ -388,7 +437,15 @@ class Optimizer:
         if model.C_trainable:
             model.gauge_fix(mode=gauge)      # start in the fixed gauge
 
-        adam_L = Adam(model.Lam.shape, lr=self.lr_lambda)
+        # A learning rate tuned on a single parameter is too large once Lambda
+        # has several entries of differing scales. Scale it down with the
+        # parameter count unless the caller has opted out.
+        n_lam = model.k * (model.k + 1) // 2
+        lr_L = self.lr_lambda / np.sqrt(n_lam) if scale_lr else self.lr_lambda
+        if scale_lr and n_lam > 1:
+            self._log(f"  lr_lambda scaled {self.lr_lambda:.4g} -> {lr_L:.4g} "
+                      f"for {n_lam} Lambda parameters")
+        adam_L = Adam(model.Lam.shape, lr=lr_L)
         adam_C = Adam(model.C.shape, lr=self.lr_C)
         adam_c = Adam((), lr=self.lr_lambda)
 
@@ -409,7 +466,9 @@ class Optimizer:
 
             G, mask = map_residual(P, self.target, self.sep_min, self.sep_max)
             loss = loss_from_residual(G, mask)
-            gLam, gC, gc = project_gradient(G, model, fit_c=self.fit_c)
+            loss_se = loss_standard_error(maps, self.target, mask)
+            W = getattr(self, "_last_susceptibility", None) if use_susceptibility else None
+            gLam, gC, gc = project_gradient(G, model, fit_c=self.fit_c, weight=W)
 
             se = self._grad_stderr(maps, self.target, model, mask, self.fit_c)
             gvec = np.concatenate([gLam.ravel(), gC.ravel(), [gc]])
@@ -422,6 +481,7 @@ class Optimizer:
                 "iter": it, "loss": loss,
                 "grad_norm": float(np.linalg.norm(gvec)),
                 "snr_max": snr_max,
+                "loss_se": loss_se,
                 "n_steps": self.budget.n_steps,
                 "n_replicas": self.budget.n_replicas,
                 "median_convergence": med_conv,
@@ -440,7 +500,8 @@ class Optimizer:
             if history_path:                 # incremental: survives interruption
                 with open(history_path, "w") as fh:
                     json.dump(res.history, fh, indent=1, default=str)
-            self._log(f"  it {it:3d}  loss {loss:.4e}  |g| {rec['grad_norm']:.3e}  "
+            self._log(f"  it {it:3d}  loss {loss:.4e}+-{loss_se:.1e}  "
+                      f"|g| {rec['grad_norm']:.3e}  "
                       f"snr {snr_max:.2f}  conv {med_conv:.3f}  "
                       f"|C|max {rec['C_absmax']:.2f}  "
                       f"M[{rec['M_min']:+.2f},{rec['M_max']:+.2f}]  "
@@ -508,8 +569,18 @@ class Optimizer:
                     self._log(f"  STOP -- {res.stop_reason}")
                     break
 
-            # ---- plateau / divergence check ----
-            if loss < best * (1 - rel_tol):
+            # ---- plateau / divergence check (NOISE-AWARE) ----
+            # Thresholds are set from the measured loss noise, not a fixed
+            # fraction. A constant threshold below the noise level makes the
+            # stopping rules fire at random.
+            if np.isfinite(loss_se) and loss_se > 0:
+                improve_thresh = max(rel_tol * best, n_sigma * loss_se)
+                worsen_thresh = n_sigma * loss_se
+            else:
+                improve_thresh = rel_tol * best
+                worsen_thresh = worsen_tol * best
+
+            if loss < best - improve_thresh:
                 best, best_it = loss, it
                 best_params = (model.Lam.copy(), model.C.copy(), model.c)
             else:
@@ -519,11 +590,11 @@ class Optimizer:
                 recent = [h["loss"] for h in res.history[-worsen_window:]]
                 if (len(recent) == worsen_window
                         and all(np.diff(recent) > 0)
-                        and loss > best * (1 + worsen_tol)):
-                    res.stop_reason = (f"loss rising for {worsen_window} "
-                                       f"iterations past the minimum "
-                                       f"(best at iter {best_it}) -- "
-                                       f"lr may be too large")
+                        and loss > best + worsen_thresh):
+                    res.stop_reason = (
+                        f"loss rising for {worsen_window} iterations and "
+                        f"{n_sigma:.0f}+ sigma above the best (iter {best_it}); "
+                        f"loss noise +-{loss_se:.2e}")
                     res.converged = True
                     res.noise_floor = best
                     self._log(f"  STOP -- {res.stop_reason}")
