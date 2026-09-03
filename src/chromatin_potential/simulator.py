@@ -614,11 +614,27 @@ class Simulator:
             pass
 
     def _convergence(self, frames):
+        """First-half vs second-half map correlation, computed on O/E.
+
+        MUST be O/E, not the raw map. The raw contact map is dominated by the
+        distance decay P(s), which is essentially identical in any two halves of
+        any trajectory regardless of whether the compartment structure has
+        equilibrated. Measured on a synthetic map with NO compartments at all and
+        only 25 frames: raw correlation 0.994, O/E correlation 0.004. A raw-map
+        gate therefore passes everything and reports ~0.92-0.99 unconditionally.
+
+        This is the same failure mode as the linear-map Pearson in the ablation
+        work, which scored 0.843 identically for the 5-state, A/B and no-type
+        arms because it too was measuring P(s).
+
+        Dividing out the distance decay leaves the compartment-scale structure,
+        which is what actually needs to converge.
+        """
         nf = len(frames)
         if nf < 4:
             return float("nan")
-        h1 = contact_probability(frames[: nf // 2])
-        h2 = contact_probability(frames[nf // 2:])
+        h1 = observed_over_expected(contact_probability(frames[: nf // 2]))
+        h2 = observed_over_expected(contact_probability(frames[nf // 2:]))
         iu = np.triu_indices(frames.shape[1], 3)
         a, b = h1[iu], h2[iu]
         m = np.isfinite(a) & np.isfinite(b)
